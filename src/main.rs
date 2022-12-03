@@ -1,9 +1,16 @@
+#![warn(clippy::pedantic)]
+
+mod errors;
+use errors::AppError;
+
 use clap::Parser;
+use color_eyre::eyre::Result;
 use indicatif::ParallelProgressIterator;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use rayon::prelude::*;
 use regex::Regex;
+use std::num::NonZeroU32;
 use std::{
     fs::File,
     io::{Read, Write},
@@ -14,14 +21,21 @@ use std::{
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Name of player 1
     player1: String,
+
+    /// Name of player 2
     player2: String,
+
+    /// Name of player 3
     player3: String,
+
+    /// Name of player 4
     player4: String,
 
     /// Number of instances to run
-    #[arg(short, long, default_value_t = 100)]
-    instances: u32,
+    #[arg(short, long, default_value_t = NonZeroU32::new(100).unwrap())]
+    instances: NonZeroU32,
 
     /// Initial seed to test
     #[arg(short, long, default_value_t = 0)]
@@ -62,12 +76,14 @@ impl TryFrom<&str> for PlayerName {
 
 struct TestConfig {
     seed: u32,
-    instances: u32,
+    instances: NonZeroU32,
     players: [PlayerName; 4],
     settings_file: String,
 }
 
-fn main() {
+fn main() -> Result<()> {
+    color_eyre::install()?;
+
     let args = Args::parse();
 
     let config = TestConfig {
@@ -82,32 +98,57 @@ fn main() {
         settings_file: args.game_settings,
     };
 
-    run_tests(config);
+    run_tests(config)?;
+
+    Ok(())
 }
 
-fn run_tests(config: TestConfig) {
+enum ExecutionResults {
+    Ok { points: [u32; 4] },
+    Crash { seed: u32 },
+}
+
+impl Default for ExecutionResults {
+    fn default() -> Self {
+        Self::Ok { points: [0; 4] }
+    }
+}
+
+#[derive(Default)]
+struct PlayerResults {
+    total_points: u32,
+    total_wins: u32,
+}
+
+#[derive(Default)]
+struct TestResults {
+    player_results: [PlayerResults; 4],
+    failed_seeds: Vec<u32>,
+}
+
+fn run_tests(config: TestConfig) -> Result<()> {
     let min_seed = config.seed;
-    let Some(max_seed) = config.seed.checked_add(config.instances - 1)
-    else {
-        todo!("Deal with out of bounds ranges");
-    };
 
-    let re = Regex::new(r"player \S* got score (\d*)").unwrap();
+    let max_seed = config
+        .seed
+        .checked_add(config.instances.get() - 1)
+        .ok_or(AppError::SeedRangeOutOfBounds)?;
 
-    let mut f = File::open(config.settings_file).unwrap();
+    let re = Regex::new(r"player \S* got score (\d*)")?;
+
+    let mut f = File::open(config.settings_file)?;
     let mut settings = String::new();
-    f.read_to_string(&mut settings).unwrap();
+    f.read_to_string(&mut settings)?;
 
-    let pb = ProgressBar::new(config.instances.into()).with_style(
-        ProgressStyle::with_template(" Running games... ({pos}/{len}) {wide_bar} {percent}% ")
-            .unwrap(),
-    );
+    let pb = ProgressBar::new(config.instances.get().into()).with_style(ProgressStyle::with_template(
+        " Running games... ({pos}/{len}) {wide_bar} {percent}% ",
+    )?);
 
     pb.tick();
 
     let results = (min_seed..=max_seed)
         .into_par_iter()
-        .map(|seed| {
+        .map::<_, Result<_>>(|seed| {
             let mut child = Command::new("./Game")
                 .args(config.players.map(|p| p.as_string()))
                 .arg("-s")
@@ -115,57 +156,89 @@ fn run_tests(config: TestConfig) {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
+                .spawn()?;
 
-            let mut stdin = child.stdin.take().unwrap();
-            stdin.write_all(settings.as_bytes()).unwrap();
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or(AppError::BrokenChildCommunication)?;
+            stdin.write_all(settings.as_bytes())?;
 
-            let mut stderr = child.stderr.take().unwrap();
+            let mut stderr = child
+                .stderr
+                .take()
+                .ok_or(AppError::BrokenChildCommunication)?;
             let mut output = String::new();
-            stderr.read_to_string(&mut output).unwrap();
+            stderr.read_to_string(&mut output)?;
 
-            if !child.wait().unwrap().success() {
-                println!("Game crashed!");
+            if !child.wait()?.success() {
+                return Ok(ExecutionResults::Crash { seed });
             }
 
-            let mut ret = [(0usize, 0usize); 4];
+            let mut ret = [0u32; 4];
 
             for (i, points) in re
                 .captures_iter(&output)
-                .map(|caps| caps.get(1).unwrap().as_str().parse::<usize>().unwrap())
+                .map(|caps| caps.get(1).unwrap().as_str().parse().unwrap())
                 .enumerate()
             {
-                ret[i].0 = points;
-            }
-            let max_points = ret.iter().map(|(x, _)| x).max().unwrap().to_owned();
-
-            for i in 0..4 {
-                ret[i].1 = if ret[i].0 == max_points { 1 } else { 0 };
+                ret[i] = points;
             }
 
-            ret
+            Ok(ExecutionResults::Ok { points: ret })
         })
         .progress_with(pb)
+        .map::<_, Result<_>>(|x| {
+            let mut ret = TestResults::default();
+            match x? {
+                ExecutionResults::Ok { points } => {
+                    for i in 0..4 {
+                        ret.player_results[i].total_points = points[i];
+                        if points[i] == *points.iter().max().unwrap() {
+                            ret.player_results[i].total_wins = 1;
+                        }
+                    }
+                }
+                ExecutionResults::Crash { seed } => ret.failed_seeds = vec![seed],
+            }
+            Ok(ret)
+        })
         .reduce(
-            || [(0usize, 0usize); 4],
+            || Ok(TestResults::default()),
             |a, b| {
-                let mut ret = [(0usize, 0usize); 4];
+                let mut a = a?;
+                let b = b?;
+
+                a.failed_seeds.extend_from_slice(&b.failed_seeds);
                 for i in 0..4 {
-                    ret[i].0 = a[i].0 + b[i].0;
-                    ret[i].1 = a[i].1 + b[i].1;
+                    a.player_results[i].total_points += b.player_results[i].total_points;
+                    a.player_results[i].total_wins += b.player_results[i].total_wins;
                 }
 
-                ret
+                Ok(a)
             },
-        );
+        )?;
 
-    for (i, res) in results.iter().enumerate() {
+    println!("Game results:");
+    #[allow(clippy::cast_possible_truncation)] // Correctness: We can't run more than u32::MAX seeds
+    let ok_games = config.instances.get() - results.failed_seeds.len() as u32;
+
+    for (i, res) in results.player_results.iter().enumerate() {
         println!(
-            "Player {} got {} points in average ({}% WR)",
+            "=> Player {} got {} points in average ({}% WR)",
             config.players[i].as_string(),
-            res.0 as f32 / config.instances as f32,
-            res.1 as f32 * 100. / config.instances as f32,
+            f64::from(res.total_points) / f64::from(ok_games),
+            f64::from(res.total_wins) * 100. / f64::from(ok_games),
         );
     }
+    println!();
+
+    if !results.failed_seeds.is_empty() {
+        println!("Some games crashed! Faulty seeds:");
+        for seed in results.failed_seeds {
+            println!("=> {seed}");
+        }
+    }
+
+    Ok(())
 }
